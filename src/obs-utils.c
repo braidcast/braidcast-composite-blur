@@ -10,6 +10,23 @@ gs_texrender_t *create_or_reset_texrender(gs_texrender_t *render)
 	return render;
 }
 
+// gs_texrender_begin refuses a texrender drawn since its last reset, and an
+// empty begin/end on one that has not been drawn leaves its contents as they
+// were, though it then counts as drawn until the next reset.
+bool texrender_drawn_since_reset(gs_texrender_t *texrender)
+{
+	gs_texture_t *texture = gs_texrender_get_texture(texrender);
+	if (!texture) {
+		return false;
+	}
+	if (!gs_texrender_begin(texrender, gs_texture_get_width(texture),
+				gs_texture_get_height(texture))) {
+		return true;
+	}
+	gs_texrender_end(texrender);
+	return false;
+}
+
 void set_blending_parameters()
 {
 	gs_blend_state_push();

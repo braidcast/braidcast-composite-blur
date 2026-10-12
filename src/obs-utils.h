@@ -9,6 +9,7 @@
 #include <stdio.h>
 
 extern gs_texrender_t *create_or_reset_texrender(gs_texrender_t *render);
+extern bool texrender_drawn_since_reset(gs_texrender_t *texrender);
 extern void set_blending_parameters();
 extern void set_render_parameters();
 void texrender_set_texture(gs_texture_t *source, gs_texrender_t *dest);

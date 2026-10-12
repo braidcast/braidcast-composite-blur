@@ -31,6 +31,8 @@ static const char *composite_blur_name(void *unused)
 
 static void composite_blur_defaults(obs_data_t *settings)
 {
+	obs_data_set_default_int(settings, "blur_algorithm", ALGO_GAUSSIAN);
+	obs_data_set_default_int(settings, "blur_type", TYPE_AREA);
 	obs_data_set_default_double(settings, "radius", 10.0);
 	obs_data_set_default_string(
 		settings, "background",
@@ -306,6 +308,39 @@ static void composite_blur_rename(void *data, calldata_t *call_data)
 	dstr_free(&disable);
 }
 
+// The blur types render_video_gaussian and render_video_box handle; the other
+// algorithms do not read blur_type.
+static bool blur_type_supported(int blur_algorithm, int blur_type)
+{
+	switch (blur_algorithm) {
+	case ALGO_GAUSSIAN:
+		return blur_type == TYPE_AREA ||
+		       blur_type == TYPE_DIRECTIONAL ||
+		       blur_type == TYPE_ZOOM || blur_type == TYPE_MOTION ||
+		       blur_type == TYPE_VECTOR;
+	case ALGO_BOX:
+		return blur_type == TYPE_AREA ||
+		       blur_type == TYPE_DIRECTIONAL ||
+		       blur_type == TYPE_ZOOM || blur_type == TYPE_TILTSHIFT;
+	default:
+		return true;
+	}
+}
+
+// Switching algorithm keeps the old blur type, which the new algorithm may have
+// no renderer for. Area is one every algorithm renders. Returns true when the
+// stored type was changed.
+static bool coerce_blur_type(obs_data_t *settings)
+{
+	if (blur_type_supported((int)obs_data_get_int(settings,
+						      "blur_algorithm"),
+				(int)obs_data_get_int(settings, "blur_type"))) {
+		return false;
+	}
+	obs_data_set_int(settings, "blur_type", TYPE_AREA);
+	return true;
+}
+
 static void composite_blur_update(void *data, obs_data_t *settings)
 {
 	struct composite_blur_filter_data *filter = data;
@@ -318,6 +353,7 @@ static void composite_blur_update(void *data, obs_data_t *settings)
 		filter->reload = true;
 	}
 
+	coerce_blur_type(settings);
 	filter->blur_type = (int)obs_data_get_int(settings, "blur_type");
 
 	if (filter->blur_type != filter->blur_type_last) {
@@ -657,30 +693,49 @@ static void composite_blur_video_render(void *data, gs_effect_t *effect)
 		return;
 	}
 
-	if (filter->rendering || filter->width == 0 || filter->height == 0) {
+	// Without an algorithm or the output effect there is nothing to draw,
+	// so pass the source through rather than leave the frame empty.
+	if (filter->rendering || filter->width == 0 || filter->height == 0 ||
+	    !filter->video_render || !filter->output_effect) {
 		obs_source_skip_video_filter(filter->context);
 		return;
 	}
 
 	filter->rendering = true;
 
-	if (filter->video_render) {
-		// 1. Get the input source as a texture renderer
-		//    accessed as filter->input_texrender after call
-		get_input_source(filter);
+	// Every texrender an algorithm or mask can swap into output_texrender
+	// (get_input_source resets input_texrender), so that only output drawn
+	// during this render counts as drawn.
+	gs_texrender_reset(filter->output_texrender);
+	gs_texrender_reset(filter->render);
+	gs_texrender_reset(filter->render2);
+	gs_texrender_reset(filter->pixelate_texrender);
+	gs_texrender_reset(filter->vb_gradient);
+	gs_texrender_reset(filter->vb_smoothed_gradient);
 
-		// 2. Apply effect to texture, and render texture to video
-		filter->video_render(filter);
+	// 1. Get the input source as a texture renderer
+	//    accessed as filter->input_texrender after call
+	get_input_source(filter);
 
-		// 3. Apply mask to texture if one is selected by the user.
-		if (filter->mask_type != EFFECT_MASK_TYPE_NONE) {
-			// Swap output and render
-			apply_effect_mask(filter);
-		}
+	// 2. Apply effect to texture, and render texture to video
+	filter->video_render(filter);
+	bool drawn = texrender_drawn_since_reset(filter->output_texrender);
 
-		// 4. Draw result (filter->output_texrender) to source
+	// 3. Apply mask to texture if one is selected by the user.
+	if (drawn && filter->mask_type != EFFECT_MASK_TYPE_NONE &&
+	    filter->effect_mask_effect) {
+		// Swap output and render
+		apply_effect_mask(filter);
+		drawn = texrender_drawn_since_reset(filter->output_texrender);
+	}
+
+	// 4. Draw result (filter->output_texrender) to source, or the
+	//    unfiltered source when this render produced no output.
+	if (drawn) {
 		draw_output_to_source(filter);
 		filter->rendered = true;
+	} else {
+		obs_source_skip_video_filter(filter->context);
 	}
 
 	filter->rendering = false;
@@ -1766,6 +1821,9 @@ static bool setting_blur_algorithm_modified(void *data, obs_properties_t *props,
 			obs_module_text("CompositeBlurFilter.Radius"), 0.0f,
 			80.01f, 0.1f, props);
 		set_gaussian_blur_types(props);
+		if (coerce_blur_type(settings)) {
+			settings_blur_area(props, settings);
+		}
 		break;
 	case ALGO_BOX:
 		setting_visibility("radius", true, props);
@@ -1787,6 +1845,9 @@ static bool setting_blur_algorithm_modified(void *data, obs_properties_t *props,
 			obs_module_text("CompositeBlurFilter.Radius"), 0.0f,
 			100.01f, 0.1f, props);
 		set_box_blur_types(props);
+		if (coerce_blur_type(settings)) {
+			settings_blur_area(props, settings);
+		}
 		break;
 	case ALGO_DUAL_KAWASE:
 		setting_visibility("radius", false, props);
